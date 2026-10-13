@@ -32,7 +32,7 @@
 
 - 언어: Python 3.11+
 - 봇 라이브러리: python-telegram-bot
-- 시세 데이터: pykrx (필요 시 증권사 API로 교체)
+- 시세 데이터: FinanceDataReader (코스피·코스닥은 네이버 출처, 필요 시 증권사 API로 교체)
 - 뉴스 데이터: 네이버 검색 API (뉴스)
 - 스케줄: 봇 내장 JobQueue (서버 상시 실행)
 - 설정 관리: python-dotenv
@@ -51,11 +51,63 @@
 
 ## 폴더 구조
 
-(구현하면서 Cursor가 갱신)
+```
+chatbot/
+├── bot/
+│   ├── __init__.py
+│   ├── main.py        # 봇 실행, 명령어(/start, /market, /news), 평일 08:30 자동 발송
+│   ├── market.py      # 코스피·코스닥·원/달러 조회와 표 만들기
+│   └── news.py        # 네이버 뉴스 검색, 제목 정리, 중복 제거
+├── .env.example       # 환경변수 이름 목록 (값은 비어 있음)
+├── .python-version    # Railway에서 쓸 Python 버전
+├── railway.json       # Railway 시작 명령과 재시작 정책
+├── requirements.txt   # 필요한 라이브러리
+├── PLAN.md            # 개발 단계별 진행 상황
+└── README.md
+```
 
 ## 실행 방법
 
-(구현 후 작성)
+### 1. 준비물
+
+- Python 3.11 이상
+- 텔레그램 봇 토큰: 텔레그램에서 [@BotFather](https://t.me/BotFather)에게 `/newbot`을 보내 발급
+- 내 chat_id: 텔레그램에서 [@userinfobot](https://t.me/userinfobot)에게 아무 메시지나 보내면 `Id` 숫자를 알려 준다
+- (선택) 네이버 검색 API 키: [네이버 개발자 센터](https://developers.naver.com/)에서 애플리케이션 등록 후 "검색" API 선택. 무료이며 하루 25,000회까지 쓸 수 있다. 비워 두면 `/news`는 "데이터를 가져오지 못했어요"라고 답한다.
+
+### 2. 내 PC에서 실행 (Windows PowerShell 기준)
+
+```powershell
+git clone https://github.com/aksuit95/chatbot.git
+cd chatbot
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+```
+
+`.env`를 열어 값을 채운 뒤 봇을 실행한다. macOS/Linux는 `source .venv/bin/activate`, `cp .env.example .env`를 쓴다.
+
+```powershell
+python -m bot.main
+```
+
+터미널에 `Application started`가 보이면 텔레그램에서 `/start`를 보내 확인한다. 끌 때는 `Ctrl+C`.
+
+시세만 터미널에서 확인하려면 `python -m bot.market`, 뉴스만 확인하려면 `python -m bot.news 반도체`.
+
+### 3. Railway에 배포 (PC를 꺼도 동작)
+
+1. [railway.com](https://railway.com)에 GitHub 계정으로 로그인한다.
+2. **New Project → Deploy from GitHub repo**에서 이 저장소를 선택한다.
+3. 서비스의 **Variables** 탭에 위 환경변수 4개를 입력한다.
+4. **Deployments** 로그에 `Application started`가 보이면 완료. 시작 명령은 `railway.json`에 들어 있어 따로 입력하지 않는다.
+
+### 주의
+
+- 같은 토큰으로 봇을 두 곳에서 동시에 실행하면 `Conflict` 오류가 나고 응답이 끊긴다. Railway에 배포했다면 내 PC의 봇은 끈다. Railway 실행 개수(replicas)도 1로 둔다.
+- 자동 발송은 평일 08:30(한국 시각)에 `ALLOWED_CHAT_ID`로 간다. 봇이 그 시각에 켜져 있어야 한다.
+- 이미 보낸 뉴스 기록은 메모리에만 저장되어, 봇을 재시작하면 지워진다.
 
 ## 개발 진행 상태
 

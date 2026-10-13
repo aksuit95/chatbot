@@ -17,7 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bot.market import FETCH_FAILED_MESSAGE, fetch_market_quotes, format_market_message
+from bot.chart import StockNotFoundError, build_stock_chart
+from bot.market import (
+    FETCH_FAILED_MESSAGE,
+    fetch_market_cap_tops,
+    fetch_market_quotes,
+    format_market_cap_message,
+    format_market_message,
+)
 from bot.news import DEFAULT_QUERY, NEWS_LIMIT, fetch_news, format_news_message
 
 logging.basicConfig(
@@ -46,10 +53,12 @@ START_MESSAGE = (
     "\n"
     "사용 가능한 명령어\n"
     "/start - 사용법 안내\n"
-    "/market - 코스피, 코스닥, 원/달러\n"
+    "/market - 코스피, 코스닥, 원/달러, 시가총액 상위 20 등락률\n"
     "/news - 최신 증시 뉴스 5건\n"
-    "/news 키워드 - 해당 키워드 뉴스 5건"
+    "/news 키워드 - 해당 키워드 뉴스 5건\n"
+    "/chart 종목명 - 최근 6개월 일봉 캔들 차트 (예: /chart 삼성전자)"
 )
+CHART_USAGE_MESSAGE = "종목명이나 종목코드를 함께 보내 주세요. 예: /chart 삼성전자"
 
 
 def parse_allowed_chat_ids(raw: str | None) -> set[int]:
@@ -110,10 +119,52 @@ async def build_market_html() -> str:
     return f"<pre>{html.escape(text)}</pre>"
 
 
+async def build_market_cap_html() -> str:
+    """코스피·코스닥 시가총액 상위 표를 텔레그램 HTML로 만든다."""
+    try:
+        tops = await asyncio.to_thread(fetch_market_cap_tops)
+    except Exception:
+        logger.exception("시가총액 순위 조회에 실패했습니다.")
+        return html.escape(FETCH_FAILED_MESSAGE)
+    tables = [format_market_cap_message(name, ranks) for name, ranks in tops]
+    return "\n\n".join(f"<pre>{html.escape(table)}</pre>" for table in tables)
+
+
 async def market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_reply(update):
         return
-    await update.message.reply_text(await build_market_html(), parse_mode=ParseMode.HTML)
+    # 지수와 시총 순위는 서로 기다릴 필요가 없어 동시에 조회한다.
+    market_html, market_cap_html = await asyncio.gather(
+        build_market_html(), build_market_cap_html()
+    )
+    await update.message.reply_text(
+        f"{market_html}\n\n{market_cap_html}", parse_mode=ParseMode.HTML
+    )
+
+
+async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not can_reply(update):
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text(CHART_USAGE_MESSAGE)
+        return
+    try:
+        # 목록 조회와 그리기가 몇 초 걸리므로 스레드에서 실행해 다른 명령을 막지 않는다.
+        stock_chart = await asyncio.to_thread(build_stock_chart, query)
+    except StockNotFoundError:
+        await update.message.reply_text(f"종목을 찾지 못했어요: {query}")
+        return
+    if stock_chart is None:
+        await update.message.reply_text(FETCH_FAILED_MESSAGE)
+        return
+    await update.message.reply_photo(
+        photo=stock_chart.image,
+        caption=(
+            f"{stock_chart.name}({stock_chart.code}) 최근 6개월 일봉\n"
+            f"종가 {stock_chart.last_close:,.0f}원 ({stock_chart.last_date})"
+        ),
+    )
 
 
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -201,6 +252,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("market", market))
     application.add_handler(CommandHandler("news", news))
+    application.add_handler(CommandHandler("chart", chart))
     application.add_error_handler(on_error)
     schedule_daily_briefing(application)
     return application

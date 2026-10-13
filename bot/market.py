@@ -1,8 +1,11 @@
-"""국내 주요 지수(코스피, 코스닥)와 원/달러 환율 조회."""
+"""국내 주요 지수(코스피, 코스닥), 원/달러 환율, 시가총액 상위 종목 조회."""
 
 import datetime
+import json
 import logging
 import unicodedata
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 
 import FinanceDataReader as fdr
@@ -30,6 +33,18 @@ FETCH_FAILED_MESSAGE = "데이터를 가져오지 못했어요"
 NAME_COLUMN_WIDTH = 10
 PRICE_COLUMN_WIDTH = 12
 
+# KRX 시가총액은 로그인이 필요해서 네이버 증권 모바일 API를 쓴다.
+# 공식 공개 API가 아니므로 주소나 응답 형식이 바뀌면 조회 실패로 처리된다.
+MARKET_CAP_URL = "https://m.stock.naver.com/api/stocks/marketValue/{market}"
+MARKET_CAP_MARKETS = {
+    "코스피": "KOSPI",
+    "코스닥": "KOSDAQ",
+}
+MARKET_CAP_LIMIT = 20
+TIMEOUT_SECONDS = 10
+# User-Agent가 없으면 네이버가 요청을 거절할 수 있다.
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 
 @dataclass
 class IndexQuote:
@@ -37,6 +52,13 @@ class IndexQuote:
     price: float
     change_percent: float  # 전일 대비 등락률(%), 예: -1.23
     date: datetime.date  # 데이터 기준일
+
+
+@dataclass
+class MarketCapRank:
+    rank: int
+    name: str
+    change_percent: float  # 전일 대비 등락률(%), 예: -1.23
 
 
 def fetch_index_quote(name: str, symbol: str) -> IndexQuote | None:
@@ -141,7 +163,61 @@ def fetch_usdkrw() -> IndexQuote | None:
         return None
 
 
+def fetch_market_cap_top(market_code: str, limit: int = MARKET_CAP_LIMIT) -> list[MarketCapRank] | None:
+    """시장(KOSPI/KOSDAQ)의 시가총액 상위 종목과 등락률. 실패하면 None."""
+    params = urllib.parse.urlencode({"page": 1, "pageSize": limit})
+    url = f"{MARKET_CAP_URL.format(market=market_code)}?{params}"
+    request = urllib.request.Request(url, headers=REQUEST_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        stocks = payload.get("stocks") or []
+        ranks = [
+            MarketCapRank(
+                rank=index,
+                name=str(stock["stockName"]),
+                # "-8.08"처럼 문자열로 오고, 천 단위 쉼표가 붙을 수도 있다.
+                change_percent=float(str(stock["fluctuationsRatio"]).replace(",", "")),
+            )
+            for index, stock in enumerate(stocks[:limit], start=1)
+        ]
+    except Exception:
+        # 응답 형식이 바뀌어 키가 없어져도 여기서 막아 봇이 죽지 않게 한다.
+        logger.exception("%s 시가총액 순위 조회에 실패했습니다.", market_code)
+        return None
+    if not ranks:
+        logger.warning("%s 시가총액 순위가 비어 있습니다.", market_code)
+        return None
+    return ranks
+
+
+def fetch_market_cap_tops() -> list[tuple[str, list[MarketCapRank] | None]]:
+    """코스피, 코스닥 시가총액 상위를 순서대로 조회한다. 실패한 시장은 None이다."""
+    return [
+        (name, fetch_market_cap_top(code))
+        for name, code in MARKET_CAP_MARKETS.items()
+    ]
+
+
+def format_market_cap_message(market_name: str, ranks: list[MarketCapRank] | None) -> str:
+    """순위, 종목명, 등락률 표. 종목명 칸은 가장 긴 이름에 맞춘다."""
+    title = f"{market_name} 시가총액 상위 {MARKET_CAP_LIMIT}"
+    if not ranks:
+        return f"{title}\n{FETCH_FAILED_MESSAGE}"
+
+    name_width = max(_display_width(rank.name) for rank in ranks) + 2
+    lines = [title]
+    for rank in ranks:
+        lines.append(
+            f"{rank.rank:>2}. {_pad(rank.name, name_width)}{rank.change_percent:+6.2f}%"
+        )
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     # 터미널 확인용: python -m bot.market
     logging.basicConfig(level=logging.INFO)
     print(format_market_message(fetch_market_quotes()))
+    for market_name, ranks in fetch_market_cap_tops():
+        print()
+        print(format_market_cap_message(market_name, ranks))

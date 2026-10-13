@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 load_dotenv(ROOT / ".env")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
 NO_NEW_NEWS_MESSAGE = "새 뉴스가 없어요."
 SEEN_NEWS_KEY = "seen_news_links"
 
@@ -53,11 +52,33 @@ START_MESSAGE = (
 )
 
 
+def parse_allowed_chat_ids(raw: str | None) -> set[int]:
+    """쉼표로 구분한 chat_id 목록을 숫자 집합으로 바꾼다. 숫자가 아닌 값은 건너뛴다."""
+    chat_ids: set[int] = set()
+    for part in (raw or "").split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if not value.lstrip("-").isdigit():
+            logger.error("ALLOWED_CHAT_ID에 숫자가 아닌 값이 있어 건너뜁니다.")
+            continue
+        chat_ids.add(int(value))
+    return chat_ids
+
+
+# 1:1 대화방과 단체방을 함께 허용하려면 "123456789,-5315329531"처럼 쉼표로 적는다.
+ALLOWED_CHAT_IDS = parse_allowed_chat_ids(os.getenv("ALLOWED_CHAT_ID"))
+
+
 def is_allowed(chat_id: int | None) -> bool:
-    """허용된 chat_id만 True. 설정이 없거나 다른 계정이면 False."""
-    if chat_id is None or not ALLOWED_CHAT_ID:
-        return False
-    return str(chat_id) == ALLOWED_CHAT_ID.strip()
+    """허용된 chat_id만 True. 설정이 없거나 다른 대화방이면 False."""
+    return chat_id is not None and chat_id in ALLOWED_CHAT_IDS
+
+
+def seen_links_for(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> set[str]:
+    """대화방마다 보낸 뉴스를 따로 기록해, 한 방에 보냈다고 다른 방에서 빠지지 않게 한다."""
+    seen_by_chat = context.bot_data.setdefault(SEEN_NEWS_KEY, {})
+    return seen_by_chat.setdefault(chat_id, set())
 
 
 def can_reply(update: Update) -> bool:
@@ -100,7 +121,7 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     # /news 반도체 처럼 명령 뒤의 단어를 검색어로 쓴다. 없으면 증시.
     query = " ".join(context.args or []).strip() or DEFAULT_QUERY
-    seen_links = context.bot_data.setdefault(SEEN_NEWS_KEY, set())
+    seen_links = seen_links_for(context, update.effective_chat.id)
     try:
         articles = await asyncio.to_thread(fetch_news, query, seen_links, NEWS_LIMIT)
     except Exception:
@@ -122,7 +143,7 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
     """예약 시각에 시황과 뉴스 헤드라인을 한 메시지로 보낸다."""
     chat_id = context.job.chat_id
-    seen_links = context.bot_data.setdefault(SEEN_NEWS_KEY, set())
+    seen_links = seen_links_for(context, chat_id)
 
     market_html = await build_market_html()
     try:
@@ -153,21 +174,21 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def schedule_daily_briefing(application: Application) -> None:
-    """평일 08:30(한국 시각)에 자동 발송을 등록한다."""
+    """평일 08:30(한국 시각)에 허용된 대화방마다 자동 발송을 등록한다."""
     if application.job_queue is None:
         logger.error("JobQueue를 쓸 수 없어 자동 발송을 등록하지 못했습니다.")
         return
-    chat_id = (ALLOWED_CHAT_ID or "").strip()
-    if not chat_id.lstrip("-").isdigit():
+    if not ALLOWED_CHAT_IDS:
         logger.error("ALLOWED_CHAT_ID가 올바르지 않아 자동 발송을 등록하지 못했습니다.")
         return
-    application.job_queue.run_daily(
-        send_daily_briefing,
-        time=BRIEFING_TIME,
-        days=WEEKDAYS,
-        chat_id=int(chat_id),
-        name=BRIEFING_JOB_NAME,
-    )
+    for chat_id in sorted(ALLOWED_CHAT_IDS):
+        application.job_queue.run_daily(
+            send_daily_briefing,
+            time=BRIEFING_TIME,
+            days=WEEKDAYS,
+            chat_id=chat_id,
+            name=BRIEFING_JOB_NAME,
+        )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

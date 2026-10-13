@@ -45,7 +45,7 @@
 | 이름 | 설명 |
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | BotFather에서 발급받은 봇 토큰 |
-| `ALLOWED_CHAT_ID` | 봇 사용을 허용할 내 chat_id |
+| `ALLOWED_CHAT_ID` | 봇 사용을 허용할 chat_id. 단체방도 허용하려면 `123456789,-5315329531`처럼 쉼표로 구분 |
 | `NAVER_CLIENT_ID` | 네이버 검색 API 클라이언트 ID |
 | `NAVER_CLIENT_SECRET` | 네이버 검색 API 시크릿 |
 
@@ -106,7 +106,8 @@ python -m bot.main
 ### 주의
 
 - 같은 토큰으로 봇을 두 곳에서 동시에 실행하면 `Conflict` 오류가 나고 응답이 끊긴다. Railway에 배포했다면 내 PC의 봇은 끈다. Railway 실행 개수(replicas)도 1로 둔다.
-- 자동 발송은 평일 08:30(한국 시각)에 `ALLOWED_CHAT_ID`로 간다. 봇이 그 시각에 켜져 있어야 한다.
+- 자동 발송은 평일 08:30(한국 시각)에 `ALLOWED_CHAT_ID`에 적힌 대화방마다 간다. 봇이 그 시각에 켜져 있어야 한다.
+- 단체방 chat_id는 [@RawDataBot](https://t.me/RawDataBot)을 잠깐 초대하면 알 수 있다. 일반 그룹이 슈퍼그룹으로 바뀌면 `-100`으로 시작하는 새 ID가 생기므로 다시 확인해 넣는다.
 - 이미 보낸 뉴스 기록은 메모리에만 저장되어, 봇을 재시작하면 지워진다.
 
 ## 개발 진행 상태

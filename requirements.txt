@@ -3,3 +3,5 @@ python-dotenv==1.2.4
 finance-datareader==0.9.202
 mplfinance==0.12.10b0
 tzdata
+google-api-python-client==2.201.0
+google-auth-oauthlib==1.5.0

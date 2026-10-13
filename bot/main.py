@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from bot.calendar import FETCH_FAILED_MESSAGE as CALENDAR_FETCH_FAILED_MESSAGE
+from bot.calendar import build_today_message
 from bot.chart import StockNotFoundError, build_stock_chart
 from bot.market import (
     FETCH_FAILED_MESSAGE,
@@ -46,6 +48,9 @@ BRIEFING_TIME = datetime.time(hour=8, minute=30, tzinfo=ZoneInfo("Asia/Seoul"))
 # python-telegram-bot 20 이후 0=일요일 ~ 6=토요일. 월~금만 보낸다.
 WEEKDAYS = (1, 2, 3, 4, 5)
 BRIEFING_JOB_NAME = "daily_briefing"
+# 일정은 시황과 달리 주말에도 보낸다. 0=일요일 ~ 6=토요일.
+CALENDAR_DAYS = (0, 1, 2, 3, 4, 5, 6)
+CALENDAR_JOB_NAME = "daily_calendar"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -224,22 +229,49 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
         seen_links.update(article.link for article in articles)
 
 
-def schedule_daily_briefing(application: Application) -> None:
-    """평일 08:30(한국 시각)에 허용된 대화방마다 자동 발송을 등록한다."""
+async def send_daily_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """매일 08:30에 오늘 일정을 시황과 다른 메시지로 보낸다."""
+    chat_id = context.job.chat_id
+    try:
+        # 구글 조회는 동기 함수라, 기다리는 동안 다른 명령을 막지 않게 스레드에서 실행한다.
+        text = await asyncio.to_thread(build_today_message)
+    except Exception:
+        logger.exception("자동 발송용 일정 조회에 실패했습니다.")
+        text = CALENDAR_FETCH_FAILED_MESSAGE
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        # 제목에 링크가 있으면 미리보기가 일정 목록을 가린다.
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+def schedule_daily_jobs(application: Application, callback, days: tuple[int, ...], name: str) -> None:
+    """같은 시각에 허용된 대화방마다 반복 작업을 등록한다."""
     if application.job_queue is None:
-        logger.error("JobQueue를 쓸 수 없어 자동 발송을 등록하지 못했습니다.")
+        logger.error("JobQueue를 쓸 수 없어 %s 자동 발송을 등록하지 못했습니다.", name)
         return
     if not ALLOWED_CHAT_IDS:
-        logger.error("ALLOWED_CHAT_ID가 올바르지 않아 자동 발송을 등록하지 못했습니다.")
+        logger.error("ALLOWED_CHAT_ID가 올바르지 않아 %s 자동 발송을 등록하지 못했습니다.", name)
         return
     for chat_id in sorted(ALLOWED_CHAT_IDS):
         application.job_queue.run_daily(
-            send_daily_briefing,
+            callback,
             time=BRIEFING_TIME,
-            days=WEEKDAYS,
+            days=days,
             chat_id=chat_id,
-            name=BRIEFING_JOB_NAME,
+            name=name,
         )
+
+
+def schedule_daily_briefing(application: Application) -> None:
+    """평일 08:30(한국 시각)에 허용된 대화방마다 자동 발송을 등록한다."""
+    schedule_daily_jobs(application, send_daily_briefing, WEEKDAYS, BRIEFING_JOB_NAME)
+
+
+def schedule_daily_calendar(application: Application) -> None:
+    """매일 08:30(한국 시각, 주말 포함)에 허용된 대화방마다 오늘 일정을 등록한다."""
+    schedule_daily_jobs(application, send_daily_calendar, CALENDAR_DAYS, CALENDAR_JOB_NAME)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -255,6 +287,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("chart", chart))
     application.add_error_handler(on_error)
     schedule_daily_briefing(application)
+    schedule_daily_calendar(application)
     return application
 
 

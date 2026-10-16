@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -29,6 +30,16 @@ TIMEOUT_SECONDS = 10
 
 # 네이버 제목에는 <b> 같은 태그와 &quot; 같은 문자가 섞여 있다.
 _TAG_PATTERN = re.compile(r"<[^>]+>")
+
+
+def clean_env(name: str) -> str:
+    """환경변수 앞뒤 공백·따옴표를 제거한다. Railway 붙여넣기 실수에 대비한다."""
+    return os.getenv(name, "").strip().strip('"').strip("'")
+
+
+def naver_key_lengths() -> tuple[int, int]:
+    """로그용으로 키 값 대신 길이만 반환한다."""
+    return len(clean_env("NAVER_CLIENT_ID")), len(clean_env("NAVER_CLIENT_SECRET"))
 
 
 @dataclass(frozen=True)
@@ -69,10 +80,16 @@ def fetch_news(
         logger.warning("뉴스 검색어가 비어 있습니다.")
         return None
 
-    client_id = os.getenv("NAVER_CLIENT_ID", "").strip()
-    client_secret = os.getenv("NAVER_CLIENT_SECRET", "").strip()
+    # Railway에 붙인 값에 따옴표가 섞여 있으면 인증이 실패한다.
+    client_id = clean_env("NAVER_CLIENT_ID")
+    client_secret = clean_env("NAVER_CLIENT_SECRET")
     if not client_id or not client_secret:
-        logger.error("NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET이 .env에 없습니다.")
+        logger.error(
+            "NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET이 없습니다. "
+            "id_len=%s secret_len=%s",
+            len(client_id),
+            len(client_secret),
+        )
         return None
 
     params = urllib.parse.urlencode(
@@ -89,8 +106,18 @@ def fetch_news(
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Railway 로그에서 401/403 원인을 바로 볼 수 있게 응답 본문도 남긴다.
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        logger.error(
+            "뉴스 조회 HTTP 실패. query=%s status=%s body=%s",
+            keyword,
+            exc.code,
+            body,
+        )
+        return None
     except Exception:
-        # 네트워크, 인증, 응답 형식 오류가 나도 호출한 쪽(봇)은 계속 살아 있어야 한다.
+        # 네트워크, 응답 형식 오류가 나도 호출한 쪽(봇)은 계속 살아 있어야 한다.
         logger.exception("뉴스 조회에 실패했습니다. query=%s", keyword)
         return None
 

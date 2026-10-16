@@ -27,7 +27,13 @@ from bot.market import (
     format_market_cap_message,
     format_market_message,
 )
-from bot.news import DEFAULT_QUERY, NEWS_LIMIT, fetch_news, format_news_message
+from bot.news import (
+    DEFAULT_QUERY,
+    NEWS_LIMIT,
+    fetch_news,
+    format_news_message,
+    naver_key_lengths,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -294,6 +300,9 @@ def build_application(token: str) -> Application:
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN이 .env에 없습니다.")
+    # 값은 찍지 않고 길이만 남겨, Railway에서 키 누락/따옴표 문제를 바로 본다.
+    id_len, secret_len = naver_key_lengths()
+    logger.info("네이버 검색 키 상태 id_len=%s secret_len=%s", id_len, secret_len)
     application = build_application(TELEGRAM_BOT_TOKEN)
     application.run_polling()
 

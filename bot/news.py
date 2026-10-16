@@ -1,4 +1,4 @@
-"""네이버 검색 API로 뉴스 헤드라인을 가져온다."""
+"""네이버 클라우드(NAVER API HUB) 검색 API로 뉴스 헤드라인을 가져온다."""
 
 import html
 import json
@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 # 스크립트로 실행해도 프로젝트 루트의 .env를 읽는다.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-NAVER_NEWS_URL = "https://openapi.naver.com/v1/search/news.json"
+# 개발자센터 openapi.naver.com 대신 클라우드 API HUB를 쓴다.
+NAVER_NEWS_URL = "https://naverapihub.apigw.ntruss.com/search/v1/news"
 # /news 뒤에 키워드가 없으면 증시 뉴스를 보여 준다.
 DEFAULT_QUERY = "증시"
 NEWS_LIMIT = 5
@@ -75,13 +76,14 @@ def fetch_news(
         return None
 
     params = urllib.parse.urlencode(
-        {"query": keyword, "display": FETCH_COUNT, "sort": "date"}
+        {"query": keyword, "display": FETCH_COUNT, "sort": "date", "format": "json"}
     )
+    # 클라우드 키는 X-Naver-* 가 아니라 X-NCP-APIGW-* 헤더로 보낸다.
     request = urllib.request.Request(
         f"{NAVER_NEWS_URL}?{params}",
         headers={
-            "X-Naver-Client-Id": client_id,
-            "X-Naver-Client-Secret": client_secret,
+            "X-NCP-APIGW-API-KEY-ID": client_id,
+            "X-NCP-APIGW-API-KEY": client_secret,
         },
     )
     try:

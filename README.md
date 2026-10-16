@@ -40,7 +40,7 @@
 - 시세 데이터: FinanceDataReader (코스피·코스닥은 네이버 출처, 필요 시 증권사 API로 교체)
 - 시가총액 순위: 네이버 증권 모바일 API (KRX는 로그인이 필요해서 사용하지 않음. 비공식 API라 형식이 바뀌면 조회 실패로 안내)
 - 차트: mplfinance (matplotlib 기반)
-- 뉴스 데이터: 네이버 검색 API (뉴스)
+- 뉴스 데이터: 네이버 클라우드 NAVER API HUB 검색 (뉴스)
 - 일정: Google Calendar API (읽기 전용). PC에서 한 번 로그인하면 refresh token을 `.env`에 저장한다
 - 스케줄: 봇 내장 JobQueue (서버 상시 실행)
 - 설정 관리: python-dotenv
@@ -54,8 +54,8 @@
 | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | BotFather에서 발급받은 봇 토큰 |
 | `ALLOWED_CHAT_ID` | 봇 사용을 허용할 chat_id. 단체방도 허용하려면 `123456789,-5315329531`처럼 쉼표로 구분 |
-| `NAVER_CLIENT_ID` | 네이버 검색 API 클라이언트 ID |
-| `NAVER_CLIENT_SECRET` | 네이버 검색 API 시크릿 |
+| `NAVER_CLIENT_ID` | 네이버 클라우드(NAVER API HUB) Client ID |
+| `NAVER_CLIENT_SECRET` | 네이버 클라우드(NAVER API HUB) Client Secret |
 | `GOOGLE_CLIENT_ID` | Google Cloud OAuth 클라이언트 ID (데스크톱 앱) |
 | `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth 클라이언트 보안 비밀 |
 | `GOOGLE_REFRESH_TOKEN` | 구글 로그인 후 자동으로 저장되는 갱신 토큰. 직접 만들지 않는다 |
@@ -85,7 +85,7 @@ chatbot/
 - Python 3.11 이상
 - 텔레그램 봇 토큰: 텔레그램에서 [@BotFather](https://t.me/BotFather)에게 `/newbot`을 보내 발급
 - 내 chat_id: 텔레그램에서 [@userinfobot](https://t.me/userinfobot)에게 아무 메시지나 보내면 `Id` 숫자를 알려 준다
-- (선택) 네이버 검색 API 키: [네이버 개발자 센터](https://developers.naver.com/)에서 애플리케이션 등록 후 "검색" API 선택. 무료이며 하루 25,000회까지 쓸 수 있다. 비워 두면 `/news`는 "데이터를 가져오지 못했어요"라고 답한다.
+- (선택) 네이버 클라우드 검색 API 키: [네이버 클라우드 콘솔](https://console.ncloud.com/)에서 NAVER API HUB 애플리케이션을 만들고 Client ID/Secret을 발급받는다. 검색 API는 하루 25,000회까지 쓸 수 있다. 비워 두면 `/news`는 "데이터를 가져오지 못했어요"라고 답한다.
 
 ### 2. 내 PC에서 실행 (Windows PowerShell 기준)
 

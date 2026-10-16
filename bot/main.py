@@ -95,6 +95,11 @@ def is_allowed(chat_id: int | None) -> bool:
     return chat_id is not None and chat_id in ALLOWED_CHAT_IDS
 
 
+def is_private_chat(chat_id: int) -> bool:
+    """개인 대화만 True. 단체방·채널 id는 음수라 개인 일정 발송에서 뺀다."""
+    return chat_id > 0
+
+
 def seen_links_for(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> set[str]:
     """대화방마다 보낸 뉴스를 따로 기록해, 한 방에 보냈다고 다른 방에서 빠지지 않게 한다."""
     seen_by_chat = context.bot_data.setdefault(SEEN_NEWS_KEY, {})
@@ -236,8 +241,12 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_daily_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """매일 08:30에 오늘 일정을 시황과 다른 메시지로 보낸다."""
+    """매일 08:30에 오늘 일정을 개인 대화에만 보낸다."""
     chat_id = context.job.chat_id
+    # 예약이 잘못 걸려도 단체방에는 개인 일정이 나가지 않게 한 번 더 거른다.
+    if chat_id is None or not is_private_chat(chat_id):
+        logger.info("단체방에는 개인 일정을 보내지 않습니다. chat_id=%s", chat_id)
+        return
     try:
         # 구글 조회는 동기 함수라, 기다리는 동안 다른 명령을 막지 않게 스레드에서 실행한다.
         text = await asyncio.to_thread(build_today_message)
@@ -252,15 +261,22 @@ async def send_daily_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def schedule_daily_jobs(application: Application, callback, days: tuple[int, ...], name: str) -> None:
-    """같은 시각에 허용된 대화방마다 반복 작업을 등록한다."""
+def schedule_daily_jobs(
+    application: Application,
+    callback,
+    days: tuple[int, ...],
+    name: str,
+    chat_ids: set[int] | None = None,
+) -> None:
+    """같은 시각에 대상 대화방마다 반복 작업을 등록한다."""
+    targets = ALLOWED_CHAT_IDS if chat_ids is None else chat_ids
     if application.job_queue is None:
         logger.error("JobQueue를 쓸 수 없어 %s 자동 발송을 등록하지 못했습니다.", name)
         return
-    if not ALLOWED_CHAT_IDS:
+    if not targets:
         logger.error("ALLOWED_CHAT_ID가 올바르지 않아 %s 자동 발송을 등록하지 못했습니다.", name)
         return
-    for chat_id in sorted(ALLOWED_CHAT_IDS):
+    for chat_id in sorted(targets):
         application.job_queue.run_daily(
             callback,
             time=BRIEFING_TIME,
@@ -276,8 +292,18 @@ def schedule_daily_briefing(application: Application) -> None:
 
 
 def schedule_daily_calendar(application: Application) -> None:
-    """매일 08:30(한국 시각, 주말 포함)에 허용된 대화방마다 오늘 일정을 등록한다."""
-    schedule_daily_jobs(application, send_daily_calendar, CALENDAR_DAYS, CALENDAR_JOB_NAME)
+    """매일 08:30(한국 시각, 주말 포함)에 개인 대화에만 오늘 일정을 등록한다."""
+    private_ids = {chat_id for chat_id in ALLOWED_CHAT_IDS if is_private_chat(chat_id)}
+    if not private_ids:
+        logger.info("개인 대화방이 없어 일정 자동 발송을 등록하지 않았습니다.")
+        return
+    schedule_daily_jobs(
+        application,
+        send_daily_calendar,
+        CALENDAR_DAYS,
+        CALENDAR_JOB_NAME,
+        private_ids,
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

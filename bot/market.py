@@ -1,4 +1,4 @@
-"""국내 주요 지수(코스피, 코스닥), 원/달러 환율, 시가총액 상위 종목 조회."""
+"""국내 주요 지수(코스피, 코스닥), 원/달러, 미국 마감 지수, 시가총액 상위 종목 조회."""
 
 import datetime
 import json
@@ -7,6 +7,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import FinanceDataReader as fdr
 
@@ -23,6 +24,15 @@ INDEX_SYMBOLS = {
 FX_NAME = "원/달러"
 FX_SYMBOL = "USD/KRW"
 
+# 미국 지수는 야후 차트다. 반도체지수는 필라델피아 반도체(^SOX)다.
+# 비어 있는 거래일이 있으면 바로 앞 종가와 비교하면 등락률이 어긋나서, 정규장 등락률 필드를 쓴다.
+US_INDEX_SYMBOLS = {
+    "나스닥": "^IXIC",
+    "S&P500": "^GSPC",
+    "반도체지수": "^SOX",
+}
+YAHOO_CHART_URL = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+
 # 긴 연휴(추석 등)에도 최소 하루치 데이터가 남도록 넉넉히 조회한다.
 LOOKBACK_DAYS = 14
 
@@ -30,7 +40,8 @@ LOOKBACK_DAYS = 14
 FETCH_FAILED_MESSAGE = "데이터를 가져오지 못했어요"
 
 # 한글은 전각이라 글자 수와 보이는 폭이 다르다. 표 칸은 이 폭에 맞춘다.
-NAME_COLUMN_WIDTH = 10
+# 반도체지수(폭 10) 뒤에도 현재가와 떨어지도록 12로 둔다.
+NAME_COLUMN_WIDTH = 12
 PRICE_COLUMN_WIDTH = 12
 
 # KRX 시가총액은 로그인이 필요해서 네이버 증권 모바일 API를 쓴다.
@@ -69,13 +80,16 @@ def fetch_index_quote(name: str, symbol: str) -> IndexQuote | None:
         if prices.empty:
             logger.warning("%s(%s) 데이터가 비어 있습니다.", name, symbol)
             return None
-        latest = prices.iloc[-1]
+        parsed = _close_and_change_percent(prices)
+        if parsed is None:
+            logger.warning("%s(%s) 비교할 데이터가 부족합니다.", name, symbol)
+            return None
+        price, change_percent, quote_date = parsed
         return IndexQuote(
             name=name,
-            price=float(latest["Close"]),
-            # Change는 비율(-0.0123)이라 100을 곱해 퍼센트로 바꾼다.
-            change_percent=float(latest["Change"]) * 100,
-            date=prices.index[-1].date(),
+            price=price,
+            change_percent=change_percent,
+            date=quote_date,
         )
     except Exception:
         # 외부 데이터 조회 실패가 봇 전체를 멈추지 않도록 여기서 막는다.
@@ -89,6 +103,72 @@ def fetch_indices() -> dict[str, IndexQuote | None]:
         name: fetch_index_quote(name, symbol)
         for name, symbol in INDEX_SYMBOLS.items()
     }
+
+
+def _close_and_change_percent(prices) -> tuple[float, float, datetime.date] | None:
+    """마지막 종가, 등락률(%), 기준일. Change 열이 없으면 바로 앞 종가로 계산한다."""
+    valid = prices.dropna(subset=["Close"])
+    if valid.empty:
+        return None
+    latest = valid.iloc[-1]
+    price = float(latest["Close"])
+    # 네이버 Change는 비율(-0.0123)이다. 야후 지수에는 이 열이 없다.
+    if "Change" in valid.columns and latest["Change"] == latest["Change"]:
+        return price, float(latest["Change"]) * 100, valid.index[-1].date()
+    if len(valid) < 2:
+        return None
+    previous_close = float(valid.iloc[-2]["Close"])
+    if previous_close == 0:
+        return None
+    change_percent = (price - previous_close) / previous_close * 100
+    return price, change_percent, valid.index[-1].date()
+
+
+def fetch_yahoo_index_quote(name: str, symbol: str) -> IndexQuote | None:
+    """야후 정규장 현재가와 등락률을 가져온다. 실패하면 None."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    params = urllib.parse.urlencode(
+        {
+            "period1": int((now - datetime.timedelta(days=LOOKBACK_DAYS)).timestamp()),
+            "period2": int((now + datetime.timedelta(days=1)).timestamp()),
+            "interval": "1d",
+        }
+    )
+    # ^GSPC처럼 기호에 ^가 있으면 주소에서 인코딩해야 한다.
+    url = f"{YAHOO_CHART_URL.format(symbol=urllib.parse.quote(symbol, safe=''))}?{params}"
+    request = urllib.request.Request(url, headers=REQUEST_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        meta = payload["chart"]["result"][0]["meta"]
+        price = meta.get("regularMarketPrice")
+        # 이 값은 이미 퍼센트다. 예: -1.208 -> -1.21%.
+        change_percent = meta.get("regularMarketChangePercent")
+        if change_percent is None:
+            change_percent = meta.get("fulldayChangePercent")
+        market_time = meta.get("regularMarketTime")
+        if price is None or change_percent is None or market_time is None:
+            logger.warning("%s(%s) 정규장 등락률이 없습니다.", name, symbol)
+            return None
+        tz_name = meta.get("exchangeTimezoneName") or "America/New_York"
+        quote_date = datetime.datetime.fromtimestamp(int(market_time), ZoneInfo(tz_name)).date()
+        return IndexQuote(
+            name=name,
+            price=float(price),
+            change_percent=float(change_percent),
+            date=quote_date,
+        )
+    except Exception:
+        logger.exception("%s(%s) 조회에 실패했습니다.", name, symbol)
+        return None
+
+
+def fetch_us_quotes() -> list[tuple[str, IndexQuote | None]]:
+    """나스닥, S&P500, 필라델피아 반도체 마감을 조회한다. 실패한 항목은 None이다."""
+    return [
+        (name, fetch_yahoo_index_quote(name, symbol))
+        for name, symbol in US_INDEX_SYMBOLS.items()
+    ]
 
 
 def fetch_market_quotes() -> list[tuple[str, IndexQuote | None]]:
@@ -113,12 +193,14 @@ def _pad(text: str, width: int) -> str:
     return text + (" " * max(width - _display_width(text), 0))
 
 
-def format_market_message(rows: list[tuple[str, IndexQuote | None]]) -> str:
+def format_market_message(
+    rows: list[tuple[str, IndexQuote | None]], title: str = "시황"
+) -> str:
     """지수명, 현재가, 등락률을 한 메시지의 표로 만든다."""
     if not rows or all(quote is None for _, quote in rows):
         return FETCH_FAILED_MESSAGE
 
-    lines = ["시황"]
+    lines = [title]
     dates = {quote.date for _, quote in rows if quote is not None}
     if len(dates) == 1:
         lines.append(f"기준일 {next(iter(dates))}")
@@ -218,6 +300,8 @@ if __name__ == "__main__":
     # 터미널 확인용: python -m bot.market
     logging.basicConfig(level=logging.INFO)
     print(format_market_message(fetch_market_quotes()))
+    print()
+    print(format_market_message(fetch_us_quotes(), title="미국 마감"))
     for market_name, ranks in fetch_market_cap_tops():
         print()
         print(format_market_cap_message(market_name, ranks))

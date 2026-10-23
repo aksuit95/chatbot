@@ -159,14 +159,18 @@ def _day_bounds(today: datetime.date) -> tuple[str, str]:
 
 
 def _list_selected_calendars(service) -> list[dict] | None:
-    """캘린더 화면에서 체크된 캘린더만 가져온다. 숨긴 캘린더는 빼 둔다."""
+    """캘린더 화면에서 체크된 캘린더만 가져온다.
+
+    구글은 체크된 캘린더도 hidden으로 내려줄 때가 있다.
+    숨김을 빼면 그 캘린더의 오늘 일정이 통째로 빠진다.
+    """
     try:
         calendars: list[dict] = []
         page_token = None
         while True:
             result = (
                 service.calendarList()
-                .list(showHidden=False, pageToken=page_token)
+                .list(showHidden=True, pageToken=page_token)
                 .execute()
             )
             calendars.extend(result.get("items", []))

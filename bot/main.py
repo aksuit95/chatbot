@@ -24,6 +24,7 @@ from bot.market import (
     FETCH_FAILED_MESSAGE,
     fetch_market_cap_tops,
     fetch_market_quotes,
+    fetch_us_quotes,
     format_market_cap_message,
     format_market_message,
 )
@@ -64,7 +65,7 @@ START_MESSAGE = (
     "\n"
     "사용 가능한 명령어\n"
     "/start - 사용법 안내\n"
-    "/market - 코스피, 코스닥, 원/달러, 시가총액 상위 20 등락률\n"
+    "/market - 코스피, 코스닥, 원/달러, 미국 마감, 시가총액 상위 20 등락률\n"
     "/news - 최신 증시 뉴스 5건\n"
     "/news 키워드 - 해당 키워드 뉴스 5건\n"
     "/chart 종목명 - 최근 6개월 일봉 캔들 차트 (예: /chart 삼성전자)"
@@ -119,20 +120,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(START_MESSAGE)
 
 
-async def build_market_html() -> str:
-    """시황 표를 텔레그램 HTML로 만든다. 실패하면 안내 문장만 돌려준다."""
-    try:
-        # 시세 조회는 동기 함수라, 기다리는 동안 다른 명령을 막지 않게 스레드에서 실행한다.
-        rows = await asyncio.to_thread(fetch_market_quotes)
-        text = format_market_message(rows)
-    except Exception:
-        logger.exception("시세 조회에 실패했습니다.")
-        text = FETCH_FAILED_MESSAGE
-
+def _quote_section_html(text: str) -> str:
+    """성공한 시세 표는 고정폭으로, 실패 문장은 그대로 이스케이프한다."""
     if text == FETCH_FAILED_MESSAGE:
         return html.escape(text)
-    # <pre>는 칸을 맞춘 표를 고정폭으로 보여 준다.
     return f"<pre>{html.escape(text)}</pre>"
+
+
+async def _load_quote_section(fetcher, title: str) -> str:
+    """시세 표 하나를 조회한다. 이 표가 실패해도 다른 표는 그대로 보낸다."""
+    try:
+        # 시세 조회는 동기 함수라, 기다리는 동안 다른 명령을 막지 않게 스레드에서 실행한다.
+        rows = await asyncio.to_thread(fetcher)
+        text = format_market_message(rows, title)
+    except Exception:
+        logger.exception("%s 조회에 실패했습니다.", title)
+        text = FETCH_FAILED_MESSAGE
+    return _quote_section_html(text)
+
+
+async def build_market_html() -> str:
+    """국내 시황과 미국 마감을 텔레그램 HTML로 만든다."""
+    # 두 표는 서로 다른 출처라 동시에 조회한다. 한쪽이 실패해도 다른 쪽은 남긴다.
+    domestic, us_close = await asyncio.gather(
+        _load_quote_section(fetch_market_quotes, "시황"),
+        _load_quote_section(fetch_us_quotes, "미국 마감"),
+    )
+    return f"{domestic}\n\n{us_close}"
 
 
 async def build_market_cap_html() -> str:

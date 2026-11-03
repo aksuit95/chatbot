@@ -4,7 +4,10 @@
 인증 정보가 없으면 브라우저 로그인을 한 번 열고, refresh token은 .env에 저장한다.
 """
 
+import argparse
 import datetime
+import hashlib
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -48,6 +51,8 @@ class CalendarEvent:
     all_day: bool
     start: datetime.datetime | None
     end: datetime.datetime | None
+    calendar_id: str = ""
+    event_id: str = ""
 
 
 def seoul_today() -> datetime.date:
@@ -234,7 +239,9 @@ def _parse_bound(bound: dict) -> tuple[datetime.datetime | None, bool]:
     return None, False
 
 
-def _to_calendar_event(calendar_name: str, event: dict) -> CalendarEvent | None:
+def _to_calendar_event(
+    calendar_name: str, event: dict, calendar_id: str = ""
+) -> CalendarEvent | None:
     if event.get("status") == "cancelled" or _user_declined(event):
         return None
     start_raw = event.get("start") or {}
@@ -250,11 +257,19 @@ def _to_calendar_event(calendar_name: str, event: dict) -> CalendarEvent | None:
         all_day=all_day or end_all_day,
         start=None if all_day else start,
         end=None if all_day else end,
+        calendar_id=calendar_id,
+        event_id=str(event.get("id") or ""),
     )
 
 
 def fetch_today_events(today: datetime.date | None = None) -> list[CalendarEvent] | None:
     """오늘과 겹치는 일정을 가져온다. 실패하면 None, 없으면 빈 목록이다."""
+    time_min, time_max = _day_bounds(today or seoul_today())
+    return fetch_events_between(time_min, time_max)
+
+
+def fetch_events_between(time_min: str, time_max: str) -> list[CalendarEvent] | None:
+    """선택된 캘린더에서 지정한 시간 구간과 겹치는 일정을 가져온다."""
     credentials = _credentials()
     if credentials is None:
         return None
@@ -268,8 +283,6 @@ def fetch_today_events(today: datetime.date | None = None) -> list[CalendarEvent
     if calendars is None:
         return None
 
-    day = today or seoul_today()
-    time_min, time_max = _day_bounds(day)
     events: list[CalendarEvent] = []
     any_success = False
     for calendar in calendars:
@@ -282,13 +295,72 @@ def fetch_today_events(today: datetime.date | None = None) -> list[CalendarEvent
         any_success = True
         calendar_name = str(calendar.get("summary") or "").strip() or "(이름 없음)"
         for raw_event in raw_events:
-            parsed = _to_calendar_event(calendar_name, raw_event)
+            parsed = _to_calendar_event(calendar_name, raw_event, calendar_id)
             if parsed is not None:
                 events.append(parsed)
     # 캘린더는 있는데 전부 실패하면 빈 일정으로 오해하지 않게 실패로 본다.
     if calendars and not any_success:
         return None
     return events
+
+
+def fetch_reminder_events(now: datetime.datetime) -> list[CalendarEvent] | None:
+    """지금부터 30분 이내에 시작하는 시간 지정 일정만 가져온다."""
+    deadline = now + datetime.timedelta(minutes=30)
+    # API의 timeMax는 배타적이라 경계에 걸린 일정도 조회되도록 1초를 더한다.
+    events = fetch_events_between(
+        now.isoformat(), (deadline + datetime.timedelta(seconds=1)).isoformat()
+    )
+    if events is None:
+        return None
+    return sorted(
+        (
+            event for event in events
+            if not event.all_day and event.start is not None
+            and now < event.start <= deadline and event.event_id
+        ),
+        key=lambda event: event.start,
+    )
+
+
+def reminder_key(chat_id: int, event: CalendarEvent) -> str:
+    # 일정 제목이나 계정 주소 대신 해시와 만료 시각만 발송 기록에 저장한다.
+    identity = json.dumps(
+        [chat_id, event.calendar_id, event.event_id, event.start.isoformat()],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def reminder_history_path() -> Path:
+    default = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or ROOT) / ".calendar-reminders.json"
+    return Path(os.getenv("CALENDAR_REMINDER_HISTORY_PATH") or default)
+
+
+def load_reminder_history(now: datetime.datetime) -> dict[str, float]:
+    path = reminder_history_path()
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {key: float(expiry) for key, expiry in data.items() if float(expiry) > now.timestamp()}
+
+
+def save_reminder_history(history: dict[str, float]) -> None:
+    path = reminder_history_path()
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(history), encoding="utf-8")
+    temporary.replace(path)
+
+
+def format_reminder(event: CalendarEvent, now: datetime.datetime) -> str:
+    minutes = max(1, int((event.start - now).total_seconds() / 60 + 0.999))
+    start = event.start.astimezone(SEOUL)
+    return (
+        f"일정 알림 · {minutes}분 후 시작\n\n"
+        f"{event.calendar_name}\n"
+        f"{start.month}월 {start.day}일 {_format_when(event, start.date())}\n"
+        f"{event.title}"
+    )
 
 
 def _format_when(event: CalendarEvent, today: datetime.date) -> str:
@@ -341,6 +413,11 @@ def build_today_message(today: datetime.date | None = None) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="구글 캘린더 오늘 일정 조회")
+    parser.add_argument(
+        "--login", action="store_true", help="기존 토큰이 있어도 구글에 다시 로그인"
+    )
+    args = parser.parse_args()
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         level=logging.INFO,
@@ -348,7 +425,7 @@ def main() -> None:
     if not _env("GOOGLE_CLIENT_ID") or not _env("GOOGLE_CLIENT_SECRET"):
         print(MISSING_CLIENT_MESSAGE)
         raise SystemExit(1)
-    if not _env("GOOGLE_REFRESH_TOKEN"):
+    if args.login or not _env("GOOGLE_REFRESH_TOKEN"):
         print("브라우저에서 구글 로그인을 진행합니다.")
         if not login_and_save():
             print(FETCH_FAILED_MESSAGE)

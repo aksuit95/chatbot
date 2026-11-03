@@ -18,7 +18,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bot.calendar import FETCH_FAILED_MESSAGE as CALENDAR_FETCH_FAILED_MESSAGE
-from bot.calendar import build_today_message
+from bot.calendar import (
+    SEOUL,
+    build_today_message,
+    fetch_reminder_events,
+    format_reminder,
+    load_reminder_history,
+    reminder_key,
+    save_reminder_history,
+)
 from bot.chart import StockNotFoundError, build_stock_chart
 from bot.market import (
     FETCH_FAILED_MESSAGE,
@@ -58,6 +66,8 @@ BRIEFING_JOB_NAME = "daily_briefing"
 # 일정은 시황과 달리 주말에도 보낸다. 0=일요일 ~ 6=토요일.
 CALENDAR_DAYS = (0, 1, 2, 3, 4, 5, 6)
 CALENDAR_JOB_NAME = "daily_calendar"
+CALENDAR_REMINDER_JOB_NAME = "calendar_reminders"
+CALENDAR_REMINDER_HISTORY_KEY = "calendar_reminder_history"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -275,6 +285,67 @@ async def send_daily_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def send_calendar_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """매분 확인해 시작 30분 전 알림을 개인 대화에 한 번씩 보낸다."""
+    targets = sorted(chat_id for chat_id in ALLOWED_CHAT_IDS if is_private_chat(chat_id))
+    if not targets:
+        return
+    now = datetime.datetime.now(SEOUL)
+    try:
+        history = context.bot_data.get(CALENDAR_REMINDER_HISTORY_KEY)
+        if history is None:
+            history = await asyncio.to_thread(load_reminder_history, now)
+            context.bot_data[CALENDAR_REMINDER_HISTORY_KEY] = history
+        for key, expiry in list(history.items()):
+            if expiry <= now.timestamp():
+                del history[key]
+        events = await asyncio.to_thread(fetch_reminder_events, now)
+    except Exception:
+        logger.exception("일정 사전 알림 조회에 실패했습니다. 다음 확인 때 재시도합니다.")
+        return
+    # 매분 확인하므로 조회 실패 안내를 반복 전송하지 않는다.
+    if events is None:
+        return
+    for event in events:
+        for chat_id in targets:
+            sent_at = datetime.datetime.now(SEOUL)
+            if event.start <= sent_at:
+                continue
+            key = reminder_key(chat_id, event)
+            if key in history:
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=format_reminder(event, sent_at),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception:
+                logger.exception("일정 사전 알림 전송에 실패했습니다. 다음 확인 때 재시도합니다.")
+                continue
+            # 성공한 전송만 기록한다. 저장 실패 시에도 실행 중 중복 전송은 막는다.
+            history[key] = event.start.timestamp()
+            try:
+                await asyncio.to_thread(save_reminder_history, history)
+            except Exception:
+                logger.exception("일정 사전 알림 발송 기록 저장에 실패했습니다.")
+
+
+def schedule_calendar_reminders(application: Application) -> None:
+    if application.job_queue is None:
+        logger.error("JobQueue를 쓸 수 없어 일정 사전 알림을 등록하지 못했습니다.")
+        return
+    if not any(is_private_chat(chat_id) for chat_id in ALLOWED_CHAT_IDS):
+        return
+    application.job_queue.run_repeating(
+        send_calendar_reminders,
+        interval=60,
+        first=1,
+        name=CALENDAR_REMINDER_JOB_NAME,
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
+    )
+
+
 def schedule_daily_jobs(
     application: Application,
     callback,
@@ -334,6 +405,7 @@ def build_application(token: str) -> Application:
     application.add_error_handler(on_error)
     schedule_daily_briefing(application)
     schedule_daily_calendar(application)
+    schedule_calendar_reminders(application)
     return application
 
 

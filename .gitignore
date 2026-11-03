@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 chart_test.png
+.calendar-reminders.json
+.calendar-reminders.tmp

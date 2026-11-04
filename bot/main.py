@@ -43,6 +43,15 @@ from bot.news import (
     format_news_message,
     naver_key_lengths,
 )
+from bot.watchlist import (
+    StockNotFoundError as WatchStockNotFoundError,
+    WatchlistFullError,
+    add_watch_stock,
+    build_watchlist_message,
+    fetch_stock_quote,
+    format_stock_quote,
+    remove_watch_stock,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -79,12 +88,22 @@ START_MESSAGE = (
     "/start - 사용법 안내\n"
     "/schedule - 오늘 구글 캘린더 일정 (개인 대화)\n"
     "/status - 서버와 자동 알림 상태 (개인 대화)\n"
+    "/stock 종목명 - 개별 종목 가격과 등락률\n"
+    "/watch - 관심종목 시세 (개인 대화)\n"
+    "/watch add 종목명 - 관심종목 추가\n"
+    "/watch remove 종목명 - 관심종목 삭제\n"
     "/market - 코스피, 코스닥, 원/달러, 미국 마감, 시가총액 상위 20 등락률\n"
     "/news - 최신 증시 뉴스 5건\n"
     "/news 키워드 - 해당 키워드 뉴스 5건\n"
     "/chart 종목명 - 최근 6개월 일봉 캔들 차트 (예: /chart 삼성전자)"
 )
 CHART_USAGE_MESSAGE = "종목명이나 종목코드를 함께 보내 주세요. 예: /chart 삼성전자"
+WATCH_USAGE_MESSAGE = (
+    "/watch - 관심종목 시세 조회\n"
+    "/watch add 삼성전자 - 추가 (최대 10개)\n"
+    "/watch remove 삼성전자 - 삭제\n"
+    "종목코드도 사용할 수 있어요. 예: /watch add 005930"
+)
 
 
 def parse_allowed_chat_ids(raw: str | None) -> set[int]:
@@ -323,6 +342,57 @@ async def chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not can_reply(update):
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text("예: /stock 삼성전자 또는 /stock 005930")
+        return
+    try:
+        quote = await asyncio.to_thread(fetch_stock_quote, query)
+        text = "네이버 KRX 시세\n\n" + format_stock_quote(quote)
+    except WatchStockNotFoundError as error:
+        text = str(error)
+    except Exception:
+        logger.exception("개별 종목 시세 조회에 실패했습니다.")
+        text = FETCH_FAILED_MESSAGE
+    await update.message.reply_text(text)
+
+
+async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await can_reply_privately(update):
+        return
+    args = context.args or []
+    chat_id = update.effective_chat.id
+    try:
+        if not args:
+            text = await asyncio.to_thread(build_watchlist_message, chat_id)
+        else:
+            action = args[0].casefold()
+            query = " ".join(args[1:]).strip()
+            if not query or action not in {"add", "remove", "추가", "삭제"}:
+                text = WATCH_USAGE_MESSAGE
+            elif action in {"add", "추가"}:
+                quote = await asyncio.to_thread(fetch_stock_quote, query)
+                added = await asyncio.to_thread(add_watch_stock, chat_id, quote)
+                text = (
+                    f"{quote.name} ({quote.code}) "
+                    + ("관심종목에 추가했어요.\n/watch로 확인하고 평일 08:30에 시세를 받아보세요." if added else "이미 등록되어 있어요.")
+                )
+            else:
+                removed = await asyncio.to_thread(remove_watch_stock, chat_id, query)
+                text = f"{removed['name']} ({removed['code']}) 삭제했어요." if removed else "등록된 종목을 찾지 못했어요. /watch로 확인해 주세요."
+    except WatchStockNotFoundError as error:
+        text = str(error)
+    except WatchlistFullError as error:
+        text = str(error)
+    except Exception:
+        logger.exception("관심종목 처리에 실패했습니다.")
+        text = "관심종목을 처리하지 못했어요. 잠시 후 다시 시도해 주세요."
+    await update.message.reply_text(text)
+
+
 async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_reply(update):
         return
@@ -378,6 +448,15 @@ async def send_daily_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if articles:
         seen_links.update(article.link for article in articles)
+
+    # 개인 관심종목은 같은 시각의 별도 메시지로 보내며 단체방에는 공개하지 않는다.
+    if is_private_chat(chat_id):
+        try:
+            watch_text = await asyncio.to_thread(build_watchlist_message, chat_id, True)
+            if watch_text:
+                await context.bot.send_message(chat_id=chat_id, text=watch_text)
+        except Exception:
+            logger.exception("관심종목 아침 발송에 실패했습니다.")
 
 
 async def send_daily_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -527,6 +606,8 @@ async def register_commands(application: Application) -> None:
             BotCommand("schedule", "오늘 일정 · 개인 대화"),
             BotCommand("status", "서버와 자동 알림 상태 · 개인 대화"),
             BotCommand("market", "국내·미국 시황과 시가총액 순위"),
+            BotCommand("stock", "개별 종목 가격과 등락률"),
+            BotCommand("watch", "관심종목 시세 · 개인 대화"),
             BotCommand("news", "최신 증시 뉴스"),
             BotCommand("chart", "종목의 최근 6개월 차트"),
         ])
@@ -540,6 +621,8 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("schedule", schedule))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("market", market))
+    application.add_handler(CommandHandler("stock", stock))
+    application.add_handler(CommandHandler("watch", watch))
     application.add_handler(CommandHandler("news", news))
     application.add_handler(CommandHandler("chart", chart))
     application.add_error_handler(on_error)

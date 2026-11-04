@@ -134,6 +134,117 @@ class ReminderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args["job_kwargs"]["max_instances"], 1)
         self.assertTrue(args["job_kwargs"]["coalesce"])
 
+    async def test_three_failures_send_one_daily_warning_and_recovery_resets_count(self):
+        with patch.object(main, "fetch_reminder_events", return_value=None):
+            for _ in range(4):
+                await main.send_calendar_reminders(self.context)
+        self.context.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.context.bot.send_message.call_args.kwargs["chat_id"], 100)
+        self.assertEqual(self.context.bot_data[main.CALENDAR_HEALTH_KEY]["failures"], 4)
+        with patch.object(main, "fetch_reminder_events", return_value=[]):
+            await main.send_calendar_reminders(self.context)
+        self.assertTrue(self.context.bot_data[main.CALENDAR_HEALTH_KEY]["ok"])
+        self.assertEqual(self.context.bot_data[main.CALENDAR_HEALTH_KEY]["failures"], 0)
+
+    async def test_warning_can_be_sent_on_next_day(self):
+        with patch.object(main, "fetch_reminder_events", return_value=None):
+            for _ in range(3):
+                await main.send_calendar_reminders(self.context)
+            self.mock_clock.now.return_value = NOW + dt.timedelta(days=1)
+            await main.send_calendar_reminders(self.context)
+        self.assertEqual(self.context.bot.send_message.await_count, 2)
+
+    async def test_failed_warning_retries_without_marking_as_sent(self):
+        self.context.bot.send_message.side_effect = [RuntimeError("temporary"), None]
+        with patch.object(main, "fetch_reminder_events", return_value=None):
+            for _ in range(2):
+                await main.send_calendar_reminders(self.context)
+            with self.assertLogs(main.logger, level="ERROR"):
+                await main.send_calendar_reminders(self.context)
+            await main.send_calendar_reminders(self.context)
+            await main.send_calendar_reminders(self.context)
+        self.assertEqual(self.context.bot.send_message.await_count, 2)
+
+
+class CalendarCommandTests(unittest.IsolatedAsyncioTestCase):
+    def update(self, chat_id):
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=chat_id),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+
+    async def test_private_schedule_returns_today_and_splits_long_messages(self):
+        update = self.update(100)
+        text = "일정\n" * 1500
+        with patch.object(main, "ALLOWED_CHAT_IDS", {100}), patch.object(main, "build_today_message", return_value=text):
+            await main.schedule(update, SimpleNamespace())
+        calls = update.message.reply_text.call_args_list
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(all(len(call.args[0]) <= 2000 for call in calls))
+        self.assertEqual("".join(call.args[0] for call in calls), text)
+
+    async def test_group_commands_never_fetch_or_disclose_personal_data(self):
+        update = self.update(-200)
+        with patch.object(main, "ALLOWED_CHAT_IDS", {-200}), patch.object(main, "build_today_message") as fetch:
+            await main.schedule(update, SimpleNamespace())
+            await main.status(update, SimpleNamespace())
+            fetch.assert_not_called()
+        self.assertEqual(update.message.reply_text.await_count, 2)
+        self.assertIn("개인 대화", update.message.reply_text.call_args.args[0])
+
+    async def test_unknown_user_is_ignored(self):
+        update = self.update(300)
+        with patch.object(main, "ALLOWED_CHAT_IDS", {100}), patch.object(main, "build_today_message") as fetch:
+            await main.schedule(update, SimpleNamespace())
+            await main.status(update, SimpleNamespace())
+            fetch.assert_not_called()
+        update.message.reply_text.assert_not_awaited()
+
+    async def test_schedule_exception_returns_failure_without_crashing(self):
+        update = self.update(100)
+        with patch.object(main, "ALLOWED_CHAT_IDS", {100}), patch.object(main, "build_today_message", side_effect=RuntimeError("offline")), self.assertLogs(main.logger, level="ERROR"):
+            await main.schedule(update, SimpleNamespace())
+        self.assertEqual(update.message.reply_text.call_args.args[0], main.CALENDAR_FETCH_FAILED_MESSAGE)
+
+    async def test_status_shows_real_next_run_failed_query_and_staleness(self):
+        update = self.update(100)
+        queue = SimpleNamespace(
+            scheduler=SimpleNamespace(running=True),
+            get_jobs_by_name=lambda name: (
+                [SimpleNamespace(chat_id=100, next_t=NOW + dt.timedelta(hours=1))]
+            ),
+        )
+        context = SimpleNamespace(job_queue=queue, bot_data={main.CALENDAR_HEALTH_KEY: {
+            "checked_at": NOW - dt.timedelta(minutes=5), "ok": False, "failures": 3,
+            "delivery_failed": True,
+        }})
+        with patch.object(main, "ALLOWED_CHAT_IDS", {100}), patch.object(main.datetime, "datetime", wraps=dt.datetime) as clock:
+            clock.now.return_value = NOW
+            await main.status(update, context)
+        text = update.message.reply_text.call_args.args[0]
+        self.assertIn("연속 3회", text)
+        self.assertIn("지연", text)
+        self.assertIn("11/04 00:45", text)
+        self.assertIn("재시도", text)
+
+    async def test_status_handles_missing_scheduler_and_no_check_yet(self):
+        update = self.update(100)
+        with patch.object(main, "ALLOWED_CHAT_IDS", {100}):
+            await main.status(update, SimpleNamespace(job_queue=None, bot_data={}))
+        text = update.message.reply_text.call_args.args[0]
+        self.assertIn("아직 확인 전", text)
+        self.assertIn("예약 기능 꺼짐", text)
+
+    async def test_commands_are_registered_and_menu_failure_does_not_stop_bot(self):
+        app = SimpleNamespace(bot=SimpleNamespace(set_my_commands=AsyncMock()))
+        await main.register_commands(app)
+        commands = app.bot.set_my_commands.call_args.args[0]
+        self.assertIn("schedule", [item.command for item in commands])
+        self.assertIn("status", [item.command for item in commands])
+        app.bot.set_my_commands.side_effect = RuntimeError("temporary")
+        with self.assertLogs(main.logger, level="ERROR"):
+            await main.register_commands(app)
+
 
 if __name__ == "__main__":
     unittest.main()

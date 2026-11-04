@@ -8,7 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import LinkPreviewOptions, Update
+from telegram import BotCommand, LinkPreviewOptions, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -68,6 +68,8 @@ CALENDAR_DAYS = (0, 1, 2, 3, 4, 5, 6)
 CALENDAR_JOB_NAME = "daily_calendar"
 CALENDAR_REMINDER_JOB_NAME = "calendar_reminders"
 CALENDAR_REMINDER_HISTORY_KEY = "calendar_reminder_history"
+CALENDAR_HEALTH_KEY = "calendar_health"
+CALENDAR_WARNING_DATES_KEY = "calendar_warning_dates"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -75,6 +77,8 @@ START_MESSAGE = (
     "\n"
     "사용 가능한 명령어\n"
     "/start - 사용법 안내\n"
+    "/schedule - 오늘 구글 캘린더 일정 (개인 대화)\n"
+    "/status - 서버와 자동 알림 상태 (개인 대화)\n"
     "/market - 코스피, 코스닥, 원/달러, 미국 마감, 시가총액 상위 20 등락률\n"
     "/news - 최신 증시 뉴스 5건\n"
     "/news 키워드 - 해당 키워드 뉴스 5건\n"
@@ -128,6 +132,118 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not can_reply(update):
         return
     await update.message.reply_text(START_MESSAGE)
+
+
+async def can_reply_privately(update: Update) -> bool:
+    if not can_reply(update):
+        return False
+    if not is_private_chat(update.effective_chat.id):
+        await update.message.reply_text("이 명령은 봇과의 개인 대화에서 사용해 주세요.")
+        return False
+    return True
+
+
+async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """아침 발송을 기다리지 않고 오늘 일정을 직접 조회한다."""
+    if not await can_reply_privately(update):
+        return
+    try:
+        text = await asyncio.to_thread(build_today_message)
+    except Exception:
+        logger.exception("명령으로 오늘 일정 조회에 실패했습니다.")
+        text = CALENDAR_FETCH_FAILED_MESSAGE
+    # 긴 일정도 텔레그램 메시지 한도를 넘지 않게 나눠 보낸다.
+    while text:
+        end = min(len(text), 2000)
+        if len(text) > end:
+            newline = text.rfind("\n", 0, end)
+            if newline > 0:
+                end = newline + 1
+        await update.message.reply_text(
+            text[:end], link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+        text = text[end:]
+
+
+def _next_job_text(context: ContextTypes.DEFAULT_TYPE, name: str, chat_id: int) -> str:
+    if context.job_queue is None:
+        return "예약 기능 꺼짐"
+    jobs = context.job_queue.get_jobs_by_name(name)
+    times = [
+        job.next_t for job in jobs
+        if job.chat_id == chat_id and getattr(job, "next_t", None) is not None
+    ]
+    if not times:
+        return "예약 없음"
+    return min(times).astimezone(SEOUL).strftime("%m/%d %H:%M")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """응답 중인 서버의 실제 예약과 최근 캘린더 확인 결과를 보여 준다."""
+    if not await can_reply_privately(update):
+        return
+    now = datetime.datetime.now(SEOUL)
+    chat_id = update.effective_chat.id
+    health = context.bot_data.get(CALENDAR_HEALTH_KEY, {})
+    checked_at = health.get("checked_at")
+    if checked_at is None:
+        check_text = "아직 확인 전"
+    else:
+        result = "정상" if health.get("ok") else f"실패 (연속 {health.get('failures', 0)}회)"
+        check_text = f"{result} · {checked_at.astimezone(SEOUL):%H:%M:%S}"
+        if now - checked_at > datetime.timedelta(minutes=3):
+            check_text += " · 최근 확인이 지연되고 있어요"
+    reminder_active = (
+        context.job_queue is not None
+        and context.job_queue.scheduler.running
+        and bool(context.job_queue.get_jobs_by_name(CALENDAR_REMINDER_JOB_NAME))
+    )
+    lines = [
+        "봇 상태", f"한국 시각: {now:%m/%d %H:%M:%S}",
+        f"최근 일정 조회: {check_text}",
+        f"30분 전 알림: {'매분 확인 중' if reminder_active else '예약 기능을 확인해 주세요'}",
+        f"다음 시황: {_next_job_text(context, BRIEFING_JOB_NAME, chat_id)}",
+        f"다음 아침 일정: {_next_job_text(context, CALENDAR_JOB_NAME, chat_id)}",
+    ]
+    last_sent = health.get("last_sent_at")
+    if last_sent:
+        lines.append(f"최근 사전 알림 전송: {last_sent.astimezone(SEOUL):%m/%d %H:%M}")
+    if health.get("delivery_failed"):
+        lines.append("최근 사전 알림 전송이 실패해 재시도 중입니다.")
+    await update.message.reply_text("\n".join(lines))
+
+
+def record_calendar_check(context: ContextTypes.DEFAULT_TYPE, now: datetime.datetime, ok: bool) -> dict:
+    health = context.bot_data.setdefault(CALENDAR_HEALTH_KEY, {})
+    health.update(checked_at=now, ok=ok, failures=0 if ok else health.get("failures", 0) + 1)
+    return health
+
+
+async def notify_calendar_failure(
+    context: ContextTypes.DEFAULT_TYPE, now: datetime.datetime, targets: list[int]
+) -> None:
+    """일시 장애는 재시도하고, 3회 연속 실패하면 하루 한 번만 안내한다."""
+    if context.bot_data[CALENDAR_HEALTH_KEY]["failures"] < 3:
+        return
+    notices = context.bot_data.setdefault(CALENDAR_WARNING_DATES_KEY, {})
+    today = now.date().isoformat()
+    for chat_id in targets:
+        if notices.get(chat_id) == today:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "일정 조회가 3회 이상 연속 실패했습니다.\n"
+                    "일정 시작 전 알림이 지연될 수 있어요.\n"
+                    "/schedule로 다시 조회하거나 /status로 상태를 확인해 주세요.\n"
+                    "계속 실패하면 구글 인증과 Railway 환경변수를 확인해 주세요."
+                ),
+            )
+        except Exception:
+            logger.exception("일정 조회 장애 안내 전송에 실패했습니다.")
+        else:
+            notices[chat_id] = today
 
 
 def _quote_section_html(text: str) -> str:
@@ -302,10 +418,14 @@ async def send_calendar_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         events = await asyncio.to_thread(fetch_reminder_events, now)
     except Exception:
         logger.exception("일정 사전 알림 조회에 실패했습니다. 다음 확인 때 재시도합니다.")
+        record_calendar_check(context, now, False)
+        await notify_calendar_failure(context, now, targets)
         return
-    # 매분 확인하므로 조회 실패 안내를 반복 전송하지 않는다.
+    health = record_calendar_check(context, now, events is not None)
     if events is None:
+        await notify_calendar_failure(context, now, targets)
         return
+    delivery_failed = False
     for event in events:
         for chat_id in targets:
             sent_at = datetime.datetime.now(SEOUL)
@@ -321,14 +441,17 @@ async def send_calendar_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
             except Exception:
+                delivery_failed = True
                 logger.exception("일정 사전 알림 전송에 실패했습니다. 다음 확인 때 재시도합니다.")
                 continue
+            health["last_sent_at"] = sent_at
             # 성공한 전송만 기록한다. 저장 실패 시에도 실행 중 중복 전송은 막는다.
             history[key] = event.start.timestamp()
             try:
                 await asyncio.to_thread(save_reminder_history, history)
             except Exception:
                 logger.exception("일정 사전 알림 발송 기록 저장에 실패했습니다.")
+    health["delivery_failed"] = delivery_failed
 
 
 def schedule_calendar_reminders(application: Application) -> None:
@@ -396,9 +519,26 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("명령 처리 중 오류가 났습니다.", exc_info=context.error)
 
 
+async def register_commands(application: Application) -> None:
+    """새 명령을 텔레그램 메뉴에서도 바로 찾을 수 있게 등록한다."""
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "봇 사용법"),
+            BotCommand("schedule", "오늘 일정 · 개인 대화"),
+            BotCommand("status", "서버와 자동 알림 상태 · 개인 대화"),
+            BotCommand("market", "국내·미국 시황과 시가총액 순위"),
+            BotCommand("news", "최신 증시 뉴스"),
+            BotCommand("chart", "종목의 최근 6개월 차트"),
+        ])
+    except Exception:
+        logger.exception("명령어 메뉴 등록에 실패했습니다. 봇은 계속 실행합니다.")
+
+
 def build_application(token: str) -> Application:
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(register_commands).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("schedule", schedule))
+    application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("market", market))
     application.add_handler(CommandHandler("news", news))
     application.add_handler(CommandHandler("chart", chart))

@@ -28,6 +28,7 @@ from bot.calendar import (
     save_reminder_history,
 )
 from bot.chart import StockNotFoundError, build_stock_chart
+from bot.ipo import fetch_listings, format_listings
 from bot.market import (
     FETCH_FAILED_MESSAGE,
     fetch_market_cap_tops,
@@ -79,6 +80,7 @@ CALENDAR_REMINDER_JOB_NAME = "calendar_reminders"
 CALENDAR_REMINDER_HISTORY_KEY = "calendar_reminder_history"
 CALENDAR_HEALTH_KEY = "calendar_health"
 CALENDAR_WARNING_DATES_KEY = "calendar_warning_dates"
+IPO_JOB_NAME = "daily_ipo"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -548,6 +550,33 @@ def schedule_calendar_reminders(application: Application) -> None:
     )
 
 
+async def send_daily_ipo(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """평일 08:30에 오늘 상장 예정 공모주를 별도 안내한다."""
+    now = datetime.datetime.now(SEOUL)
+    # 실행 지연으로 개장 후에 도착하는 '30분 전' 알림은 보내지 않는다.
+    if now.time() >= datetime.time(9, 0):
+        logger.warning("개장 시간이 지나 공모주 알림을 보내지 않았습니다.")
+        return
+    try:
+        listings = await asyncio.to_thread(fetch_listings, now.date())
+    except Exception:
+        logger.exception("공모주 상장 예정 조회에 실패했습니다.")
+        try:
+            await context.bot.send_message(
+                chat_id=context.job.chat_id,
+                text="오늘 공모주 상장 예정 정보를 확인하지 못했어요. 한국거래소 KIND에서 직접 확인해 주세요.\nhttps://kind.krx.co.kr/listinvstg/pubofrprogcom.do?method=searchPubofrProgComMain",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            logger.exception("공모주 조회 실패 안내도 전송하지 못했습니다.")
+        return
+    if listings:
+        await context.bot.send_message(
+            chat_id=context.job.chat_id, text=format_listings(now.date(), listings),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+
 def schedule_daily_jobs(
     application: Application,
     callback,
@@ -629,6 +658,7 @@ def build_application(token: str) -> Application:
     schedule_daily_briefing(application)
     schedule_daily_calendar(application)
     schedule_calendar_reminders(application)
+    schedule_daily_jobs(application, send_daily_ipo, WEEKDAYS, IPO_JOB_NAME)
     return application
 
 

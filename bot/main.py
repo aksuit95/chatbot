@@ -29,6 +29,7 @@ from bot.calendar import (
 )
 from bot.chart import StockNotFoundError, build_stock_chart
 from bot.ipo import fetch_listings, format_listings
+from bot.lockup import fetch_lockups, format_lockups, SOURCE_URL as LOCKUP_SOURCE_URL
 from bot.market import (
     FETCH_FAILED_MESSAGE,
     fetch_market_cap_tops,
@@ -81,6 +82,7 @@ CALENDAR_REMINDER_HISTORY_KEY = "calendar_reminder_history"
 CALENDAR_HEALTH_KEY = "calendar_health"
 CALENDAR_WARNING_DATES_KEY = "calendar_warning_dates"
 IPO_JOB_NAME = "daily_ipo"
+LOCKUP_JOB_NAME = "daily_lockup"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -550,6 +552,28 @@ def schedule_calendar_reminders(application: Application) -> None:
     )
 
 
+async def send_daily_lockup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """매일 08:30에 출처에 등록된 해당일 락업 해제 예정 항목을 알린다."""
+    now = datetime.datetime.now(SEOUL)
+    if now.time() >= datetime.time(9, 0):
+        return
+    try:
+        checked, events = await asyncio.to_thread(fetch_lockups, now.date())
+    except Exception:
+        logger.exception("공모주 락업 일정 조회에 실패했습니다.")
+        await context.bot.send_message(
+            chat_id=context.job.chat_id,
+            text=f"오늘 공모주 락업 해제 예정 정보를 확인하지 못했어요. 직접 확인해 주세요.\n{LOCKUP_SOURCE_URL}",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+    if events:
+        await context.bot.send_message(
+            chat_id=context.job.chat_id, text=format_lockups(now.date(), checked, events),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+
 async def send_daily_ipo(context: ContextTypes.DEFAULT_TYPE) -> None:
     """평일 08:30에 오늘 상장 예정 공모주를 별도 안내한다."""
     now = datetime.datetime.now(SEOUL)
@@ -659,6 +683,7 @@ def build_application(token: str) -> Application:
     schedule_daily_calendar(application)
     schedule_calendar_reminders(application)
     schedule_daily_jobs(application, send_daily_ipo, WEEKDAYS, IPO_JOB_NAME)
+    schedule_daily_jobs(application, send_daily_lockup, CALENDAR_DAYS, LOCKUP_JOB_NAME)
     return application
 
 

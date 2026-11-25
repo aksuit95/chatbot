@@ -5,5 +5,7 @@ __pycache__/
 chart_test.png
 .calendar-reminders.json
 .calendar-reminders.tmp
+.dram-monitor-*.json
+.dram-monitor-*.tmp
 .watchlist.json
 .watchlist.tmp

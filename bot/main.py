@@ -29,6 +29,7 @@ from bot.calendar import (
 )
 from bot.chart import StockNotFoundError, build_stock_chart
 from bot.ipo import fetch_listings, format_listings
+from bot.dram_monitor import fetch_prices as fetch_dram_prices, fetch_articles as fetch_dram_articles, load_state as load_dram_state, save_state as save_dram_state, make_update as make_dram_update
 from bot.lockup import fetch_lockups, format_lockups, SOURCE_URL as LOCKUP_SOURCE_URL
 from bot.market import (
     FETCH_FAILED_MESSAGE,
@@ -83,6 +84,7 @@ CALENDAR_HEALTH_KEY = "calendar_health"
 CALENDAR_WARNING_DATES_KEY = "calendar_warning_dates"
 IPO_JOB_NAME = "daily_ipo"
 LOCKUP_JOB_NAME = "daily_lockup"
+DRAM_JOB_NAME = "dram_updates"
 
 START_MESSAGE = (
     "시황 뉴스 봇입니다.\n"
@@ -552,6 +554,60 @@ def schedule_calendar_reminders(application: Application) -> None:
     )
 
 
+async def send_dram_update(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """공개 가격과 기사 중 이전 확인 때와 달라진 내용만 개인 대화에 알린다."""
+    chat_id = context.job.chat_id
+    if chat_id is None or not is_private_chat(chat_id):
+        return
+    day = datetime.datetime.now(SEOUL).date()
+    try:
+        previous = await asyncio.to_thread(load_dram_state, chat_id)
+    except Exception:
+        logger.exception("DRAM 확인 기록을 읽지 못했습니다.")
+        await context.bot.send_message(chat_id=chat_id, text="DRAM 확인 기록을 읽지 못해 알림을 확인하지 못했어요. 서버 저장 상태를 확인해 주세요.")
+        return
+    prices, articles = await asyncio.gather(
+        asyncio.to_thread(fetch_dram_prices),
+        asyncio.to_thread(fetch_dram_articles, day),
+        return_exceptions=True,
+    )
+    if isinstance(prices, BaseException):
+        logger.error("DRAM 현물가격 조회에 실패했습니다: %s", type(prices).__name__)
+        prices = None
+    if isinstance(articles, BaseException):
+        logger.error("TrendForce 기사 조회에 실패했습니다: %s", type(articles).__name__)
+        articles = None
+    message, updated = make_dram_update(day, previous, prices, articles)
+    if message:
+        # 텔레그램 글자 수 제한에 맞춰 나누며, 모든 전송에 성공한 뒤 기록한다.
+        while message:
+            end = min(len(message), 3500)
+            if end < len(message):
+                boundary = message.rfind("\n", 0, end)
+                if boundary > 0:
+                    end = boundary + 1
+            await context.bot.send_message(
+                chat_id=chat_id, text=message[:end],
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            message = message[end:]
+    await asyncio.to_thread(save_dram_state, chat_id, updated)
+
+
+def schedule_dram_updates(application: Application) -> None:
+    if application.job_queue is None:
+        logger.error("JobQueue가 없어 DRAM 동향을 등록하지 못했습니다.")
+        return
+    for chat_id in sorted(chat_id for chat_id in ALLOWED_CHAT_IDS if is_private_chat(chat_id)):
+        for hour in (8, 16):
+            application.job_queue.run_daily(
+                send_dram_update,
+                time=datetime.time(hour, 30 if hour == 8 else 0, tzinfo=SEOUL),
+                days=WEEKDAYS, chat_id=chat_id, name=DRAM_JOB_NAME,
+                job_kwargs={"misfire_grace_time": 300},
+            )
+
+
 async def send_daily_lockup(context: ContextTypes.DEFAULT_TYPE) -> None:
     """매일 08:30에 출처에 등록된 해당일 락업 해제 예정 항목을 알린다."""
     now = datetime.datetime.now(SEOUL)
@@ -684,6 +740,7 @@ def build_application(token: str) -> Application:
     schedule_calendar_reminders(application)
     schedule_daily_jobs(application, send_daily_ipo, WEEKDAYS, IPO_JOB_NAME)
     schedule_daily_jobs(application, send_daily_lockup, CALENDAR_DAYS, LOCKUP_JOB_NAME)
+    schedule_dram_updates(application)
     return application
 
 
